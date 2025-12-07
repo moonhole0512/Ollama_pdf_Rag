@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+requests
+
+# LangChain and RAG components
+langchain==0.2.14
+langchain-community==0.2.12
+langchain-core==0.2.33
+langchain-text-splitters==0.2.2
+langchainhub
+pypdf
+faiss-cpu
+langchain-google-genai
+flashrank
+tqdm
+rank-bm25
