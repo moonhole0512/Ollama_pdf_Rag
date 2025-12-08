@@ -32,7 +32,7 @@ interface ChatPanelProps {
   messages: ChatMessage[];
   onSendMessage: (message: string) => void;
   isGeneratingResponse: boolean;
-  pdfProcessed: boolean;
+  isSessionActive: boolean; // Changed from pdfProcessed
 }
 
 // --- Styled Components ---
@@ -69,7 +69,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({
   messages,
   onSendMessage,
   isGeneratingResponse,
-  pdfProcessed,
+  isSessionActive, // Changed from pdfProcessed
 }) => {
   const [inputMessage, setInputMessage] = React.useState<string>('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -101,7 +101,7 @@ const ChatPanel: React.FC<ChatPanelProps> = ({
         <List>
           {messages.length === 0 && (
             <Typography variant="body2" color="textSecondary" align="center" sx={{ mt: 4 }}>
-              {pdfProcessed ? "Ask a question about your PDF." : "Upload and process a PDF to start chatting."}
+              {isSessionActive ? "Ask a question about the selected document(s)." : "Upload a PDF and/or select documents to start a RAG session."}
             </Typography>
           )}
           {messages.map((msg, index) => (
@@ -135,17 +135,17 @@ const ChatPanel: React.FC<ChatPanelProps> = ({
           multiline
           maxRows={5}
           variant="outlined"
-          placeholder={pdfProcessed ? "Type your message..." : "Please process a PDF first"}
+          placeholder={isSessionActive ? "Type your message..." : "Please start a RAG session first"}
           value={inputMessage}
           onChange={(e) => setInputMessage(e.target.value)}
           onKeyPress={handleKeyPress}
-          disabled={!pdfProcessed || isGeneratingResponse}
+          disabled={!isSessionActive || isGeneratingResponse}
           sx={{ mr: 1 }}
         />
         <Button
           variant="contained"
           onClick={handleSendClick}
-          disabled={!pdfProcessed || isGeneratingResponse || inputMessage.trim() === ''}
+          disabled={!isSessionActive || isGeneratingResponse || inputMessage.trim() === ''}
           endIcon={<SendIcon />}
         >
           Send

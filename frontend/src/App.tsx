@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import axios from 'axios';
 import {
   AppBar,
   Toolbar,
@@ -21,10 +20,14 @@ import {
   ToggleButtonGroup,
   ToggleButton,
   Divider,
+  Checkbox,
+  FormGroup,
+  FormControlLabel,
 } from '@mui/material';
 import { useDropzone } from 'react-dropzone';
 import { styled } from '@mui/material/styles';
 import ChatPanel from './components/ChatPanel';
+import { api, type SetActiveDocsRequest } from './api'; // Import api service and new interface
 
 // --- Interfaces & Constants ---
 interface DocumentSource {
@@ -32,7 +35,6 @@ interface DocumentSource {
   metadata: { page: number; source: string; };
 }
 
-// Correctly defined interface for Ollama models list
 interface OllamaModel {
   name: string;
   modified_at: string;
@@ -47,7 +49,6 @@ interface ChatMessage {
 
 type ModelProvider = 'ollama' | 'google';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 const GOOGLE_CHAT_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"];
 const GOOGLE_EMBEDDING_MODELS = ["models/text-embedding-004", "models/embedding-001"];
 const DEFAULT_SYSTEM_PROMPT = '답변은 반드시 한글로만 작성해주세요.';
@@ -66,16 +67,21 @@ function App() {
   const [provider, setProvider] = useState<ModelProvider>('ollama');
   const [googleApiKey, setGoogleApiKey] = useState<string>('');
   const [systemPrompt, setSystemPrompt] = useState<string>(() => localStorage.getItem('systemPrompt') || DEFAULT_SYSTEM_PROMPT);
-  const [retrievalK, setRetrievalK] = useState<number>(20);
-  
-  const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]); // Correctly typed state
+  const [retrievalK, setRetrievalK] = useState<number>(5); // Default to 5 for Ensemble Retriever
+
+  const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
   const [chatModel, setChatModel] = useState<string>('');
   const [embeddingModel, setEmbeddingModel] = useState<string>('');
   
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [processingPdf, setProcessingPdf] = useState<boolean>(false);
-  const [pdfProcessed, setPdfProcessed] = useState<boolean>(false);
   
+  // New state for document management
+  const [allDocuments, setAllDocuments] = useState<string[]>([]);
+  const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
+  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
+  const [isActivatingSession, setIsActivatingSession] = useState<boolean>(false);
+
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isGeneratingResponse, setIsGeneratingResponse] = useState<boolean>(false);
   
@@ -91,39 +97,59 @@ function App() {
     setSnackbarOpen(true);
   };
 
-  useEffect(() => {
+  // --- API Calls ---
+  const fetchOllamaModels = useCallback(async () => {
     if (provider === 'ollama') {
-      axios.get<{ models: OllamaModel[] }>(`${API_BASE_URL}/api/ollama/models`) // Correct type for axios.get
-        .then(response => {
-          const models = response.data.models;
-          setOllamaModels(models);
-          if (models.length > 0) {
-            const qwenModel = models.find((m: any) => m.name.startsWith('qwen2.5:14b'));
-            const bgeModel = models.find((m: any) => m.name.startsWith('bge-m3'));
-            setChatModel(qwenModel ? qwenModel.name : models[0].name);
-            setEmbeddingModel(bgeModel ? bgeModel.name : models[0].name);
-          }
-        })
-        .catch(error => {
-            console.error("Failed to fetch Ollama models:", error);
-            showSnackbar('Failed to fetch Ollama models. Is Ollama running?', 'error');
-        });
+      try {
+        const models = await api.getOllamaModels();
+        setOllamaModels(models);
+        if (models.length > 0) {
+          const qwenModel = models.find((m: any) => m.name.startsWith('qwen2.5:14b'));
+          const bgeModel = models.find((m: any) => m.name.startsWith('bge-m3'));
+          setChatModel(qwenModel ? qwenModel.name : models[0].name);
+          setEmbeddingModel(bgeModel ? bgeModel.name : models[0].name);
+        }
+      } catch (error) {
+          console.error("Failed to fetch Ollama models:", error);
+          showSnackbar('Failed to fetch Ollama models. Is Ollama running?', 'error');
+      }
     } else {
       setChatModel(GOOGLE_CHAT_MODELS[0]);
       setEmbeddingModel(GOOGLE_EMBEDDING_MODELS[0]);
     }
   }, [provider]);
 
+  const fetchDocuments = useCallback(async () => {
+    try {
+      const docs = await api.getDocuments();
+      setAllDocuments(docs);
+    } catch (error) {
+      console.error("Failed to fetch documents:", error);
+      showSnackbar('Failed to fetch processed documents.', 'error');
+    }
+  }, []);
+
+  // --- Effects ---
+  useEffect(() => {
+    fetchOllamaModels();
+  }, [fetchOllamaModels]);
+
+  useEffect(() => {
+    fetchDocuments();
+  }, [fetchDocuments]);
+
+  useEffect(() => {
+    localStorage.setItem('systemPrompt', systemPrompt);
+  }, [systemPrompt]);
+
+  // --- Handlers ---
   const handleSystemPromptChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newValue = e.target.value;
-    setSystemPrompt(newValue);
-    localStorage.setItem('systemPrompt', newValue);
+    setSystemPrompt(e.target.value);
   };
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length > 0 && acceptedFiles[0].type === 'application/pdf') {
       setSelectedFile(acceptedFiles[0]);
-      setPdfProcessed(false);
       showSnackbar(`Selected file: ${acceptedFiles[0].name}`, 'info');
     } else {
       showSnackbar('Only PDF files are allowed.', 'error');
@@ -140,21 +166,15 @@ function App() {
       showSnackbar('Please enter your Google API Key.', 'error'); return;
     }
 
-    setProcessingPdf(true); setPdfProcessed(false);
+    setProcessingPdf(true);
+    setIsSessionActive(false); // Deactivate session if a new PDF is uploaded
     showSnackbar('Uploading and processing PDF...', 'info');
 
-    const formData = new FormData();
-    formData.append('file', selectedFile);
-    formData.append('provider', provider);
-    formData.append('embedding_model', embeddingModel);
-    if (provider === 'google') formData.append('google_api_key', googleApiKey);
-
     try {
-      const response = await axios.post(`${API_BASE_URL}/api/upload`, formData);
-      showSnackbar(response.data.message, 'success');
-      setPdfProcessed(true);
-      setChatMessages([]);
-      chatHistoryRef.current = [];
+      const response = await api.uploadPdf(selectedFile, provider, embeddingModel, googleApiKey || undefined);
+      showSnackbar(response.message, 'success');
+      setSelectedFile(null); // Clear selected file after upload
+      fetchDocuments(); // Refresh document list
     } catch (error: any) {
       showSnackbar(error.response?.data?.detail || 'Failed to process PDF.', 'error');
     } finally {
@@ -162,22 +182,75 @@ function App() {
     }
   };
 
+  const handleDocumentSelection = (docName: string, isChecked: boolean) => {
+    setSelectedDocuments(prev => {
+      const newSelection = new Set(prev);
+      if (isChecked) {
+        newSelection.add(docName);
+      } else {
+        newSelection.delete(docName);
+      }
+      return newSelection;
+    });
+  };
+
+  const handleActivateSession = async () => {
+    if (selectedDocuments.size === 0) {
+      showSnackbar('Please select at least one document to activate RAG session.', 'error');
+      return;
+    }
+    if (!embeddingModel) {
+      showSnackbar('Please select an Embedding Model.', 'error');
+      return;
+    }
+    if (provider === 'google' && !googleApiKey) {
+      showSnackbar('Please enter your Google API Key.', 'error');
+      return;
+    }
+
+    setIsActivatingSession(true);
+    setIsSessionActive(false); // Deactivate current session until new one is ready
+    setChatMessages([]); // Clear chat history
+    chatHistoryRef.current = [];
+
+    showSnackbar('Activating RAG session...', 'info');
+
+    try {
+      const reqPayload: SetActiveDocsRequest = {
+        document_names: Array.from(selectedDocuments),
+        provider,
+        embedding_model: embeddingModel,
+        google_api_key: googleApiKey || undefined,
+      };
+      const response = await api.setActiveDocuments(reqPayload);
+      showSnackbar(response.message, 'success');
+      setIsSessionActive(true);
+    } catch (error: any) {
+      showSnackbar(error.response?.data?.detail || 'Failed to activate RAG session.', 'error');
+    } finally {
+      setIsActivatingSession(false);
+    }
+  };
+
   const handleSendMessage = async (message: string) => {
-    if (!pdfProcessed || (provider === 'google' && !googleApiKey)) {
-      showSnackbar(pdfProcessed ? 'Please enter your Google API Key.' : 'Please upload and process a PDF first.', 'error'); return;
+    if (!isSessionActive) {
+      showSnackbar('Please activate a RAG session by selecting documents first.', 'error'); return;
+    }
+    if (provider === 'google' && !googleApiKey) {
+      showSnackbar('Please enter your Google API Key.', 'error'); return;
     }
     
     setIsGeneratingResponse(true);
     setChatMessages(prev => [...prev, { type: 'user', text: message }]);
 
     try {
-      const response = await axios.post<any, { data: { answer: string; source_documents: DocumentSource[] } }>(`${API_BASE_URL}/api/chat`, {
+      const response = await api.chat({
         provider, question: message, chat_history: chatHistoryRef.current,
         chat_model: chatModel, embedding_model: embeddingModel,
         google_api_key: googleApiKey, system_prompt: systemPrompt,
         retrieval_k: retrievalK,
       });
-      const { answer, source_documents } = response.data;
+      const { answer, source_documents } = response; // api.chat now returns the full response data
       setChatMessages(prev => [...prev, { type: 'ai', text: answer, sources: source_documents }]);
       chatHistoryRef.current = [...chatHistoryRef.current, [message, answer]];
     } catch (error: any) {
@@ -195,13 +268,13 @@ function App() {
       <Box sx={{ my: 2 }}>
         <FormControl fullWidth sx={{ mb: 2 }}>
           <InputLabel id="chat-model-label">Chat Model</InputLabel>
-          <Select labelId="chat-model-label" value={chatModel} label="Chat Model" onChange={(e) => setChatModel(e.target.value)} disabled={models.length === 0 || processingPdf}>
+          <Select labelId="chat-model-label" value={chatModel} label="Chat Model" onChange={(e) => setChatModel(e.target.value)} disabled={models.length === 0 || processingPdf || isActivatingSession}>
             {models.map((name: string) => (<MenuItem key={name} value={name}>{name}</MenuItem>))}
           </Select>
         </FormControl>
         <FormControl fullWidth>
           <InputLabel id="embedding-model-label">Embedding Model</InputLabel>
-          <Select labelId="embedding-model-label" value={embeddingModel} label="Embedding Model" onChange={(e) => setEmbeddingModel(e.target.value)} disabled={embeddingModels.length === 0 || processingPdf}>
+          <Select labelId="embedding-model-label" value={embeddingModel} label="Embedding Model" onChange={(e) => setEmbeddingModel(e.target.value)} disabled={embeddingModels.length === 0 || processingPdf || isActivatingSession}>
             {embeddingModels.map((name: string) => (<MenuItem key={name} value={name}>{name}</MenuItem>))}
           </Select>
         </FormControl>
@@ -227,6 +300,7 @@ function App() {
             {renderModelSelectors()}
             <Divider sx={{ my: 1 }}><Typography variant="overline">Retrieval</Typography></Divider>
             <TextField label="Chunks to Retrieve (k)" type="number" value={retrievalK} onChange={(e) => setRetrievalK(Number(e.target.value))} fullWidth sx={{ mb: 2 }}/>
+            
             <Divider sx={{ my: 1 }}><Typography variant="overline">PDF Upload</Typography></Divider>
             <DropzoneContainer {...getRootProps()}>
               <input {...getInputProps()} />
@@ -236,10 +310,35 @@ function App() {
             <Button variant="contained" onClick={handlePdfUpload} disabled={!selectedFile || processingPdf} sx={{ mt: 2 }}>
               {processingPdf ? <CircularProgress size={24} /> : 'Process PDF'}
             </Button>
-            {pdfProcessed && <Alert severity="success" sx={{ mt: 1 }}>PDF is ready.</Alert>}
+
+            <Divider sx={{ my: 2 }}><Typography variant="overline">Select Documents for RAG</Typography></Divider>
+            {allDocuments.length === 0 ? (
+              <Typography variant="body2" color="textSecondary" sx={{ mb: 2 }}>No processed documents found. Upload a PDF first.</Typography>
+            ) : (
+              <FormGroup sx={{ mb: 2 }}>
+                {allDocuments.map(docName => (
+                  <FormControlLabel
+                    key={docName}
+                    control={
+                      <Checkbox
+                        checked={selectedDocuments.has(docName)}
+                        onChange={(e) => handleDocumentSelection(docName, e.target.checked)}
+                        name={docName}
+                      />
+                    }
+                    label={docName}
+                  />
+                ))}
+              </FormGroup>
+            )}
+            <Button variant="contained" onClick={handleActivateSession} disabled={selectedDocuments.size === 0 || isActivatingSession || !embeddingModel} sx={{ mb: 2 }}>
+              {isActivatingSession ? <CircularProgress size={24} /> : 'Start RAG Session'}
+            </Button>
+            {isSessionActive && <Alert severity="success" sx={{ mt: 1 }}>RAG Session Active!</Alert>}
+
           </Paper>
           <Paper elevation={3} sx={{ flexGrow: 1, p: 2, display: 'flex', flexDirection: 'column' }}>
-            <ChatPanel messages={chatMessages} onSendMessage={handleSendMessage} isGeneratingResponse={isGeneratingResponse} pdfProcessed={pdfProcessed} />
+            <ChatPanel messages={chatMessages} onSendMessage={handleSendMessage} isGeneratingResponse={isGeneratingResponse} isSessionActive={isSessionActive} />
           </Paper>
         </Stack>
       </Container>

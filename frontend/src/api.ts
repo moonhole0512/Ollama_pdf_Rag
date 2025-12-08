@@ -2,55 +2,73 @@ import axios from 'axios';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
-interface ChatRequest {
+// --- Interfaces ---
+export interface ChatRequest {
+  provider: string;
   question: string;
-  chat_history?: [string, string][];
   chat_model: string;
   embedding_model: string;
+  google_api_key?: string;
+  system_prompt?: string;
+  retrieval_k?: number;
+  chat_history?: [string, string][];
 }
 
-interface ChatResponse {
+export interface SetActiveDocsRequest {
+  document_names: string[];
+  provider: string;
+  embedding_model: string;
+  google_api_key?: string;
+}
+
+export interface ChatResponse {
   answer: string;
+  source_documents: any[]; 
 }
 
-interface OllamaModel {
-  model: string;
-  name?: string;
+export interface OllamaModel {
+  name: string;
   modified_at: string;
   size: number;
 }
 
-interface UploadResponse {
+export interface UploadResponse {
   status: string;
   filename: string;
   message: string;
 }
 
+// --- API Service ---
 export const api = {
   getOllamaModels: async (): Promise<OllamaModel[]> => {
-    const response = await axios.get(`${API_BASE_URL}/api/ollama/models`);
-    return response.data.models.map((m: any) => ({
-      model: m.model,
-      name: m.model.split(':')[0],
-      modified_at: m.modified_at,
-      size: m.size,
-    }));
+    const response = await axios.get<{ models: any[] }>(`${API_BASE_URL}/api/ollama/models`);
+    return response.data.models;
+  },
+  
+  getDocuments: async (): Promise<string[]> => {
+    const response = await axios.get<string[]>(`${API_BASE_URL}/api/documents`);
+    return response.data;
   },
 
-  uploadPdf: async (file: File, embeddingModel: string): Promise<UploadResponse> => {
+  uploadPdf: async (file: File, provider: string, embeddingModel: string, googleApiKey?: string): Promise<UploadResponse> => {
     const formData = new FormData();
     formData.append('file', file);
+    formData.append('provider', provider);
     formData.append('embedding_model', embeddingModel);
-    const response = await axios.post(`${API_BASE_URL}/api/upload`, formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
-    });
+    if (provider === 'google' && googleApiKey) {
+      formData.append('google_api_key', googleApiKey);
+    }
+    const response = await axios.post<UploadResponse>(`${API_BASE_URL}/api/upload`, formData);
+    return response.data;
+  },
+  
+  setActiveDocuments: async (req: SetActiveDocsRequest): Promise<{message: string}> => {
+    const response = await axios.post(`${API_BASE_URL}/api/set-active-documents`, req);
     return response.data;
   },
 
   chat: async (request: ChatRequest): Promise<ChatResponse> => {
-    const response = await axios.post(`${API_BASE_URL}/api/chat`, request);
+    const response = await axios.post<ChatResponse>(`${API_BASE_URL}/api/chat`, request);
     return response.data;
   },
 };
