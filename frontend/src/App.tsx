@@ -23,11 +23,12 @@ import {
   Checkbox,
   FormGroup,
   FormControlLabel,
+  LinearProgress, // Import LinearProgress
 } from '@mui/material';
 import { useDropzone } from 'react-dropzone';
 import { styled } from '@mui/material/styles';
 import ChatPanel from './components/ChatPanel';
-import { api, type SetActiveDocsRequest } from './api'; // Import api service and new interface
+import { api, type SetActiveDocsRequest, type ProgressData } from './api';
 
 // --- Interfaces & Constants ---
 interface DocumentSource {
@@ -67,7 +68,7 @@ function App() {
   const [provider, setProvider] = useState<ModelProvider>('ollama');
   const [googleApiKey, setGoogleApiKey] = useState<string>('');
   const [systemPrompt, setSystemPrompt] = useState<string>(() => localStorage.getItem('systemPrompt') || DEFAULT_SYSTEM_PROMPT);
-  const [retrievalK, setRetrievalK] = useState<number>(5); // Default to 5 for Ensemble Retriever
+  const [retrievalK, setRetrievalK] = useState<number>(5);
 
   const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
   const [chatModel, setChatModel] = useState<string>('');
@@ -75,8 +76,8 @@ function App() {
   
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [processingPdf, setProcessingPdf] = useState<boolean>(false);
-  
-  // New state for document management
+  const [progress, setProgress] = useState<ProgressData>({ current: 0, total: 0, status: 'idle', message: '' });
+
   const [allDocuments, setAllDocuments] = useState<string[]>([]);
   const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
@@ -90,6 +91,8 @@ function App() {
   const [snackbarSeverity, setSnackbarSeverity] = useState<'success' | 'error' | 'info'>('info');
 
   const chatHistoryRef = useRef<[string, string][]>([]);
+  const progressIntervalRef = useRef<number | null>(null);
+
 
   const showSnackbar = (message: string, severity: 'success' | 'error' | 'info' = 'info') => {
     setSnackbarMessage(message);
@@ -142,6 +145,42 @@ function App() {
     localStorage.setItem('systemPrompt', systemPrompt);
   }, [systemPrompt]);
 
+  // Effect for polling PDF processing progress
+  useEffect(() => {
+    if (processingPdf) {
+      progressIntervalRef.current = window.setInterval(async () => {
+        try {
+          const progressData = await api.getProgress();
+          setProgress(progressData);
+          if (['completed', 'error'].includes(progressData.status)) {
+            if (progressIntervalRef.current) {
+              clearInterval(progressIntervalRef.current);
+            }
+            setProcessingPdf(false);
+            if (progressData.status === 'completed') {
+              showSnackbar('PDF processed successfully!', 'success');
+              setSelectedFile(null);
+              fetchDocuments();
+            } else {
+              showSnackbar(`Error processing PDF: ${progressData.message}`, 'error');
+            }
+          }
+        } catch (error) {
+          console.error("Failed to fetch progress", error);
+          if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+          setProcessingPdf(false);
+          showSnackbar('Failed to get processing status.', 'error');
+        }
+      }, 1000); // Poll every second
+    }
+    // Cleanup
+    return () => {
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+      }
+    };
+  }, [processingPdf, fetchDocuments]);
+
   // --- Handlers ---
   const handleSystemPromptChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setSystemPrompt(e.target.value);
@@ -158,28 +197,25 @@ function App() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop });
 
-  const handlePdfUpload = async () => {
+  const handlePdfUpload = () => {
     if (!selectedFile || !embeddingModel) {
       showSnackbar('Please select a PDF and an Embedding Model.', 'error'); return;
     }
     if (provider === 'google' && !googleApiKey) {
       showSnackbar('Please enter your Google API Key.', 'error'); return;
     }
-
+    
     setProcessingPdf(true);
-    setIsSessionActive(false); // Deactivate session if a new PDF is uploaded
-    showSnackbar('Uploading and processing PDF...', 'info');
+    setProgress({ current: 0, total: 0, status: 'starting', message: 'Initiating upload...' });
+    setIsSessionActive(false);
 
-    try {
-      const response = await api.uploadPdf(selectedFile, provider, embeddingModel, googleApiKey || undefined);
-      showSnackbar(response.message, 'success');
-      setSelectedFile(null); // Clear selected file after upload
-      fetchDocuments(); // Refresh document list
-    } catch (error: any) {
-      showSnackbar(error.response?.data?.detail || 'Failed to process PDF.', 'error');
-    } finally {
-      setProcessingPdf(false);
-    }
+    api.uploadPdf(selectedFile, provider, embeddingModel, googleApiKey || undefined)
+      .catch((error: any) => {
+        // This initial catch is for immediate API errors (e.g., network failure)
+        // The polling effect will handle processing errors on the backend.
+        showSnackbar(error.response?.data?.detail || 'Failed to start PDF processing.', 'error');
+        setProcessingPdf(false); // Stop polling if the upload call itself fails
+      });
   };
 
   const handleDocumentSelection = (docName: string, isChecked: boolean) => {
@@ -209,8 +245,8 @@ function App() {
     }
 
     setIsActivatingSession(true);
-    setIsSessionActive(false); // Deactivate current session until new one is ready
-    setChatMessages([]); // Clear chat history
+    setIsSessionActive(false);
+    setChatMessages([]);
     chatHistoryRef.current = [];
 
     showSnackbar('Activating RAG session...', 'info');
@@ -250,7 +286,7 @@ function App() {
         google_api_key: googleApiKey, system_prompt: systemPrompt,
         retrieval_k: retrievalK,
       });
-      const { answer, source_documents } = response; // api.chat now returns the full response data
+      const { answer, source_documents } = response;
       setChatMessages(prev => [...prev, { type: 'ai', text: answer, sources: source_documents }]);
       chatHistoryRef.current = [...chatHistoryRef.current, [message, answer]];
     } catch (error: any) {
@@ -305,11 +341,24 @@ function App() {
             <DropzoneContainer {...getRootProps()}>
               <input {...getInputProps()} />
               <Typography align="center">{isDragActive ? "Drop PDF here" : "Drag 'n' drop or click"}</Typography>
-              {selectedFile && <Typography variant="body2" sx={{ mt: 1 }}>{selectedFile.name}</Typography>}
+              {selectedFile && !processingPdf && <Typography variant="body2" sx={{ mt: 1 }}>{selectedFile.name}</Typography>}
             </DropzoneContainer>
-            <Button variant="contained" onClick={handlePdfUpload} disabled={!selectedFile || processingPdf} sx={{ mt: 2 }}>
-              {processingPdf ? <CircularProgress size={24} /> : 'Process PDF'}
-            </Button>
+            
+            {processingPdf ? (
+              <Box sx={{ width: '100%', mt: 2 }}>
+                <Typography variant="body2" align="center" sx={{ mb: 1 }}>
+                  {progress.message} ({progress.current} / {progress.total > 0 ? progress.total : '?'})
+                </Typography>
+                <LinearProgress 
+                  variant={progress.total > 0 ? "determinate" : "indeterminate"} 
+                  value={progress.total > 0 ? (progress.current / progress.total) * 100 : undefined} 
+                />
+              </Box>
+            ) : (
+              <Button variant="contained" onClick={handlePdfUpload} disabled={!selectedFile} sx={{ mt: 2 }}>
+                Process PDF
+              </Button>
+            )}
 
             <Divider sx={{ my: 2 }}><Typography variant="overline">Select Documents for RAG</Typography></Divider>
             {allDocuments.length === 0 ? (

@@ -38,6 +38,13 @@ export interface UploadResponse {
   message: string;
 }
 
+export interface ProgressData {
+  current: number;
+  total: number;
+  status: string;
+  message: string;
+}
+
 // --- API Service ---
 export const api = {
   getOllamaModels: async (): Promise<OllamaModel[]> => {
@@ -59,6 +66,11 @@ export const api = {
       formData.append('google_api_key', googleApiKey);
     }
     const response = await axios.post<UploadResponse>(`${API_BASE_URL}/api/upload`, formData);
+    return response.data;
+  },
+
+  getProgress: async (): Promise<ProgressData> => {
+    const response = await axios.get<ProgressData>(`${API_BASE_URL}/api/progress`);
     return response.data;
   },
   
