@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Tuple, Dict, Any, Optional
 from urllib.parse import quote_plus, unquote_plus
+from difflib import SequenceMatcher
 
 # --- LangChain Imports ---
 from langchain_community.chat_models import ChatOllama
@@ -52,8 +53,6 @@ class ChatRequest(BaseModel):
     google_api_key: Optional[str] = None
     retrieval_k: Optional[int] = 5
     chat_history: List[Tuple[str, str]] = []
-    
-    # New fields for summarization and advanced Q&A
     mode: str = "auto"
     include_citations: bool = True
 
@@ -64,7 +63,6 @@ class DocumentSource(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     source_documents: List[DocumentSource]
-    # New fields for transparency
     citations: List[str] = []
     used_search_queries: List[str] = []
 
@@ -191,14 +189,14 @@ def analyze_book_structure(docs: List[Document]) -> Dict[str, Any]:
     
     chapter_list_patterns = [
         r'(?:^|\n)(\d{1,2})[\.장\s]+([^\n\.]{5,80})',
-        r'(?:^|\n)제?(\d{1,2})장[：:\s]+([^\n\.]{5,80})',
+        r'(?:^|\n)제?(\d{1,2})장[:\s]+([^\n\.]{5,80})',
         r'(?:^|\n)Chapter\s+(\d{1,2})[:\s]+([^\n\.]{5,80})',
     ]
     
     chapter_start_patterns = [
         r'^(\d{1,2})\s+([^\d\n]{10,80})$',
-        r'^제?(\d{1,2})장[\s：:]+([^\n]{5,80})$',
-        r'^Chapter\s+(\d{1,2})[\s：:]+([^\n]{5,80})$',
+        r'^제?(\d{1,2})장[\s:]+([^\n]{5,80})$',
+        r'^Chapter\s+(\d{1,2})[\s:]+([^\n]{5,80})$',
     ]
     
     toc_candidate_pages = []
@@ -304,11 +302,11 @@ def concept_aware_chunking(
     
     # Parent 청크 - 개념 경계 고려
     parent_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,      # 2000 -> 1500 (더 작게)
-        chunk_overlap=300,    # 200 -> 300 (더 크게, 개념 중복 보장)
+        chunk_size=1500,
+        chunk_overlap=300,
         separators=[
-            "\n\n\n",         # 섹션 구분
-            "\n\n",           # 문단 구분
+            "\n\n\n",
+            "\n\n",
             "\n",
             ". ",
             "。",
@@ -317,7 +315,7 @@ def concept_aware_chunking(
     
     # Child 청크 - 더 세밀하게
     child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,       # 400 -> 300
+        chunk_size=300,
         chunk_overlap=100,
         separators=[
             "\n\n",
@@ -386,32 +384,89 @@ def concept_aware_chunking(
         
     return parent_docs, child_docs
 
+def fuzzy_similarity(s1: str, s2: str) -> float:
+    """Fuzzy 문자열 유사도 계산 (0.0 ~ 1.0)"""
+    return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+
+def preprocess_query(query: str) -> str:
+    """쿼리 전처리: 불필요한 문자 제거, 핵심 키워드 추출"""
+    # 중복 따옴표 제거
+    query = re.sub(r'["""\'\']{2,}', '', query)
+    query = re.sub(r'["\']', '', query)
+    
+    # 불필요한 조사 제거 (선택적)
+    # query = re.sub(r'(에\s*대해서?|에\s*관해서?|에\s*대한|에\s*관한)', '', query)
+    
+    return query.strip()
+
 def calculate_chunk_importance(doc: Document, query: str) -> float:
-    """청크의 중요도 점수 계산"""
+    """청크의 중요도 점수 계산 (향상된 버전)"""
     
     content = doc.page_content.lower()
-    query_terms = query.lower().split()
+    query_lower = query.lower()
+    query_terms = query_lower.split()
     
-    # 1. 키워드 빈도
+    # 1. 정확한 쿼리 매칭 (최우선)
+    if query_lower in content:
+        exact_match_bonus = 50.0
+    else:
+        exact_match_bonus = 0.0
+    
+    # 2. Fuzzy 매칭 (OCR 오류 대응)
+    max_fuzzy_score = 0.0
+    content_chunks = content.split('\n')
+    for chunk in content_chunks:
+        if len(chunk) > 10:  # 너무 짧은 라인 제외
+            fuzzy_score = fuzzy_similarity(query_lower, chunk)
+            if fuzzy_score > max_fuzzy_score:
+                max_fuzzy_score = fuzzy_score
+    
+    fuzzy_bonus = max_fuzzy_score * 30.0 if max_fuzzy_score > 0.6 else 0.0
+    
+    # 3. 키워드 빈도
     keyword_count = sum(content.count(term) for term in query_terms)
     
-    # 2. 키워드 밀도
+    # 4. 키워드 밀도
     keyword_density = keyword_count / len(content) if len(content) > 0 else 0
     
-    # 3. 제목/개념명 일치 보너스
+    # 5. 개념 제목 매칭 (향상)
     concept_title = doc.metadata.get("concept_title", "").lower()
-    title_match = any(term in concept_title for term in query_terms)
+    title_match_score = 0.0
     
-    # 4. 섹션 위치 보너스 (앞부분이 개념 정의일 가능성 높음)
+    if concept_title and concept_title != "n/a":
+        # 정확한 매칭
+        if query_lower in concept_title or concept_title in query_lower:
+            title_match_score = 40.0
+        else:
+            # Fuzzy 매칭
+            fuzzy_title_score = fuzzy_similarity(query_lower, concept_title)
+            if fuzzy_title_score > 0.5:
+                title_match_score = fuzzy_title_score * 30.0
+    
+    # 6. 챕터 제목 매칭
+    chapter_title = doc.metadata.get("chapter_title", "").lower()
+    chapter_match_score = 0.0
+    
+    if chapter_title and chapter_title != "n/a":
+        for term in query_terms:
+            if term in chapter_title:
+                chapter_match_score += 5.0
+    
+    # 7. 페이지 위치 보너스 (개념 정의는 보통 앞부분)
     position_bonus = 1.0
     page_num = doc.metadata.get("page", 999)
     if page_num < 100:
-        position_bonus = 1.2
+        position_bonus = 1.1
+    elif page_num < 200:
+        position_bonus = 1.05
     
     # 종합 점수
     importance = (
+        exact_match_bonus +
+        fuzzy_bonus +
+        title_match_score +
+        chapter_match_score +
         keyword_density * 100 +
-        (10 if title_match else 0) +
         keyword_count * 2
     ) * position_bonus
     
@@ -421,8 +476,8 @@ def get_adaptive_k(query_info: Dict[str, Any], query: str) -> Dict[str, int]:
     """쿼리 특성에 따라 검색 깊이를 동적으로 조정"""
     
     # 기본값
-    initial_k = 20  # 초기 검색 범위
-    final_k = 5     # 최종 반환 문서 수
+    initial_k = 40  # 20 -> 40 (더 넓게 검색)
+    final_k = 10     # 5 -> 10 (더 많은 후보 유지)
     
     query_lower = query.lower()
     
@@ -432,8 +487,8 @@ def get_adaptive_k(query_info: Dict[str, Any], query: str) -> Dict[str, int]:
         "전략", "원리", "법칙", "효과", "방법", "기법"
     ]
     if any(indicator in query_lower for indicator in concept_indicators):
-        initial_k = 30  # 더 넓게 검색
-        final_k = 8     # 더 많은 후보 유지
+        initial_k = 50  # 더 넓게 검색
+        final_k = 12     # 더 많은 후보 유지
     
     # 2. 비교/나열 질문 (여러 문서 필요)
     comparison_indicators = [
@@ -460,32 +515,42 @@ def get_adaptive_k(query_info: Dict[str, Any], query: str) -> Dict[str, int]:
     }
 
 def get_adaptive_weights(query: str, query_info: Dict[str, Any]) -> Tuple[float, float]:
-    """쿼리 특성에 따라 BM25/Dense 가중치 동적 조정"""
+    """쿼리 특성에 따라 BM25/Dense 가중치 동적 조정 (OCR 고려)"""
     
     query_lower = query.lower()
     
-    # 1. 정확한 키워드 매칭이 중요한 경우 (BM25 우선)
+    # OCR 품질이 낮을 것으로 예상되는 경우 Dense 검색 강화
+    # 1. 특수 문자나 따옴표가 포함된 경우
+    if '"' in query or "'" in query or '「' in query or '」' in query:
+        return (0.3, 0.7)  # Dense 우선
+    
+    # 2. 긴 구문 검색 (OCR 오류 가능성)
+    if len(query.split()) > 5:
+        return (0.4, 0.6)  # Dense 우선
+    
+    # 3. 정확한 키워드 매칭이 중요한 경우
     keyword_indicators = [
         "이란", "이라는", "전략", "법칙", "원리",
-        "효과", "방법", "기법", '"', "'"
+        "효과", "방법", "기법", "정의"
     ]
     if any(ind in query_lower for ind in keyword_indicators):
-        return (0.7, 0.3)  # BM25 70%, Dense 30%
+        # 하지만 OCR을 고려하여 Dense도 비중 있게
+        return (0.4, 0.6)  # 이전 0.7, 0.3에서 변경
     
-    # 2. 의미적 이해가 중요한 경우 (Dense 우선)
+    # 4. 의미적 이해가 중요한 경우 (Dense 우선)
     semantic_indicators = [
         "왜", "어떻게", "설명", "이유", "과정",
         "관계", "영향", "차이"
     ]
     if any(ind in query_lower for ind in semantic_indicators):
-        return (0.3, 0.7)  # BM25 30%, Dense 70%
+        return (0.3, 0.7)
     
-    # 3. 개념 정의의 경우 BM25 강조
+    # 5. 개념 정의의 경우 균형
     if query_info.get("type") == "concept_definition":
-        return (0.7, 0.3)
+        return (0.4, 0.6)  # Dense 약간 우선 (OCR 대응)
     
-    # 4. 기본값 (균형)
-    return (0.5, 0.5)
+    # 6. 기본값 (균형)
+    return (0.4, 0.6)  # 이전 0.5, 0.5에서 변경
 
 def classify_query_advanced(
     query: str, 
@@ -493,6 +558,8 @@ def classify_query_advanced(
 ) -> Dict[str, Any]:
     """향상된 쿼리 분류 및 확장"""
     
+    # 쿼리 전처리
+    query = preprocess_query(query)
     query_lower = query.lower()
     
     # 맥락 해결 (대명사 처리)
@@ -507,24 +574,27 @@ def classify_query_advanced(
     # 1. 개념 정의 질문 감지 (최우선)
     definition_patterns = [
         r'(.+?)(이란|란|이라는|라는|은 무엇|는 무엇|이 뭐|가 뭐)',
-        r'(.+?)(에 대해|에대해).+?(설명|말해|알려)',
-        r'(전략|원리|법칙|효과|방법|기법).+?(뭐|무엇)',
+        r'(.+?)(에 대해|에대해).+(설명|말해|알려)',
+        r'(전략|원리|법칙|효과|방법|기법).+(뭐|무엇)',
     ]
     
     for pattern in definition_patterns:
         match = re.search(pattern, query_lower)
         if match:
             concept = match.group(1).strip()
+            
+            # 핵심 키워드 추출 (조사 제거)
+            concept_clean = re.sub(r'\s+(에|의|를|을|가|이|은|는)$', '', concept)
+            
             return {
                 "type": "concept_definition",
-                "concept": concept,
+                "concept": concept_clean,
                 "search_queries": [
-                    query,
-                    f'"{concept}"',  # 정확한 매칭
-                    f'{concept} 정의',
-                    f'{concept} 의미',
-                    f'{concept}이란',
-                    concept,  # 단독 키워드
+                    query,  # 원본 쿼리
+                    concept_clean,  # 핵심 키워드만
+                    f'{concept_clean} 전략',  # 변형 1
+                    f'{concept_clean} 방법',  # 변형 2
+                    # 따옴표 제거 (이전에 있던 문제)
                 ]
             }
     
@@ -562,12 +632,12 @@ def multi_stage_retrieval(
     all_parent_docs: List[Document],
     chat_request: ChatRequest
 ) -> List[Document]:
-    """다단계 검색 파이프라인"""
+    """다단계 검색 파이프라인 (향상된 버전)"""
     
     # Stage 1: 적응형 K값 결정
     adaptive_k = get_adaptive_k(query_info, query)
     
-    # Stage 2: 가중치 조정
+    # Stage 2: 가중치 조정 (OCR 고려)
     bm25_weight, dense_weight = get_adaptive_weights(query, query_info)
     ensemble_retriever.weights = [bm25_weight, dense_weight]
     
@@ -577,19 +647,21 @@ def multi_stage_retrieval(
     print(f"   Final K: {adaptive_k['final_k']}")
     print(f"   Weights: BM25={bm25_weight:.1f}, Dense={dense_weight:.1f}")
     
-    # Stage 3: Query Expansion
+    # Stage 3: Query Expansion (개선)
     expanded_queries = query_info["search_queries"]
-    
-    # 키워드 검색이 중요한 경우 원본 쿼리 강조
-    if bm25_weight > 0.5:
-        expanded_queries = [query] * 2 + expanded_queries
     
     # Stage 4: 초기 검색 (넓게)
     all_retrieved = []
-    for q in expanded_queries[:5]:  # 최대 5개 쿼리
+    seen_contents = set()
+    
+    for q in expanded_queries[:5]:
         try:
             docs = ensemble_retriever.get_relevant_documents(q)
-            all_retrieved.extend(docs[:adaptive_k['initial_k']])
+            for doc in docs[:adaptive_k['initial_k']]:
+                content_key = doc.page_content[:100]
+                if content_key not in seen_contents:
+                    all_retrieved.append(doc)
+                    seen_contents.add(content_key)
         except Exception as e:
             print(f"   Warning: Query '{q}' failed: {e}")
             continue
@@ -598,43 +670,70 @@ def multi_stage_retrieval(
         print("   ⚠️ No documents retrieved, using fallback")
         return all_parent_docs[:adaptive_k['final_k']]
     
-    # Stage 5: 중복 제거 + 중요도 점수 추가
-    unique_docs = {}
-    for doc in all_retrieved:
-        key = doc.page_content[:100]  # 앞 100자로 중복 판단
-        if key not in unique_docs:
-            importance = calculate_chunk_importance(doc, query)
-            unique_docs[key] = (doc, importance)
+    print(f"   📚 Total retrieved (before dedup): {len(all_retrieved)}")
     
-    print(f"   📚 Unique documents: {len(unique_docs)}")
+    # Stage 5: 중요도 점수 추가 (향상)
+    docs_with_importance = []
+    for doc in all_retrieved:
+        importance = calculate_chunk_importance(doc, query)
+        docs_with_importance.append((doc, importance))
     
     # Stage 6: Cross-Encoder Reranking
     cross_encoder = get_cross_encoder_model()
     docs_with_scores = []
     
-    for doc, importance in unique_docs.values():
+    for doc, importance in docs_with_importance:
         try:
             # Cross-encoder 점수
             ce_score = cross_encoder.predict([[query, doc.page_content]])[0]
             
-            # 중요도와 결합 (가중 평균)
-            combined_score = 0.6 * float(ce_score) + 0.4 * min(importance, 1.0)
+            # 중요도와 결합 (중요도 비중 증가)
+            combined_score = 0.5 * float(ce_score) + 0.5 * min(importance / 10.0, 1.0)
             
-            docs_with_scores.append((doc, combined_score))
+            docs_with_scores.append((doc, combined_score, importance))
         except Exception as e:
             # Cross-encoder 실패 시 중요도만 사용
-            docs_with_scores.append((doc, importance * 0.01))
+            docs_with_scores.append((doc, importance * 0.01, importance))
     
     # Stage 7: 최종 정렬 및 선택
     docs_with_scores.sort(key=lambda x: x[1], reverse=True)
-    final_docs = [doc for doc, score in docs_with_scores[:adaptive_k['final_k']]]
     
-    # Stage 8: 디버깅 정보 출력
+    # Stage 8: Multi-hop 검색 (초기 검색 실패 시)
+    top_score = docs_with_scores[0][1] if docs_with_scores else 0
+    
+    if top_score < 0.3:  # 신뢰도가 낮으면
+        print("   🔄 Low confidence, attempting multi-hop retrieval...")
+        
+        # 인접 페이지 검색
+        top_pages = [doc.metadata.get('page', 0) for doc, _, _ in docs_with_scores[:5]]
+        expanded_pages = set()
+        
+        for page in top_pages:
+            expanded_pages.update(range(page - 2, page + 3))  # 앞뒤 2페이지
+        
+        additional_docs = [
+            doc for doc in all_parent_docs
+            if doc.metadata.get('page', 0) in expanded_pages
+        ]
+        
+        # 추가 문서 점수 계산
+        for doc in additional_docs:
+            if doc not in [d for d, _, _ in docs_with_scores]:
+                importance = calculate_chunk_importance(doc, query)
+                docs_with_scores.append((doc, importance * 0.005, importance))
+        
+        docs_with_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    final_docs = [doc for doc, _, _ in docs_with_scores[:adaptive_k['final_k']]]
+    
+    # Stage 9: 디버깅 정보 출력 (향상)
     print(f"\n📊 Top Retrieval Results:")
-    for i, (doc, score) in enumerate(docs_with_scores[:10], 1):
+    for i, (doc, score, importance) in enumerate(docs_with_scores[:15], 1):
         page = doc.metadata.get('page', '?')
-        concept = doc.metadata.get('concept_title', 'N/A')[:30]
-        print(f"   {i}. Page {page:3} | Score: {score:.3f} | Concept: {concept}")
+        concept = doc.metadata.get('concept_title', 'N/A')[:40]
+        content_preview = doc.page_content[:60].replace('\n', ' ')
+        print(f"   {i:2}. Page {page:3} | Score: {score:.3f} | Imp: {importance:6.1f} | {concept}")
+        print(f"       Preview: {content_preview}...")
     
     return final_docs
 
@@ -743,7 +842,7 @@ async def upload_pdf(
             raise HTTPException(status_code=400, detail="Could not extract text from the PDF.")
 
         print(f"\n📄 Document Type: {doc_type}")
-        print(f"🔍 '{file.filename}' 구조 분석 중...")
+        print(f"📚 '{file.filename}' 구조 분석 중...")
         doc_structure = analyze_document_structure(docs, doc_type)
 
         progress_data.update({"status": "chunking", "message": "Splitting document..."})
@@ -770,18 +869,14 @@ async def upload_pdf(
             doc_texts = [doc.page_content for doc in child_docs]
             text_embeddings = [None] * len(doc_texts)
             
-            # Use max_workers to control concurrency, os.cpu_count() can be aggressive but let's try it
-            # Using more threads than cores can be beneficial for I/O-bound tasks like API calls.
             max_workers = min(32, (os.cpu_count() or 1) * 4)
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Dispatch all embedding tasks
                 future_to_index = {
                     executor.submit(embeddings.embed_query, text): i for i, text in enumerate(doc_texts)
                 }
                 
                 progress_data["current"] = 0
-                # Process as they complete
                 for future in tqdm(as_completed(future_to_index), total=len(doc_texts), desc="Generating Embeddings (Parallel)"):
                     index = future_to_index[future]
                     try:
@@ -790,10 +885,8 @@ async def upload_pdf(
                     except Exception as exc:
                         print(f'   - Document {index} generated an exception: {exc}')
                     
-                    # Update progress for every completed embedding
                     progress_data["current"] += 1
             
-            # Filter out any that failed
             successful_embeddings = [item for item in text_embeddings if item is not None]
             successful_metadatas = [
                 child_docs[i].metadata for i, item in enumerate(text_embeddings) if item is not None
@@ -804,7 +897,6 @@ async def upload_pdf(
             
             progress_data.update({"status": "indexing", "message": "Creating FAISS index..."})
             
-            # Create FAISS index from the generated embeddings
             faiss_vectorstore = FAISS.from_embeddings(
                 text_embeddings=successful_embeddings,
                 embedding=embeddings,
@@ -896,7 +988,7 @@ async def set_active_documents(req: SetActiveDocsRequest):
         bm25_retriever = BM25Retriever.from_documents(all_parent_docs)
         ensemble_retriever = EnsembleRetriever(
             retrievers=[bm25_retriever, parent_retriever],
-            weights=[0.5, 0.5]
+            weights=[0.4, 0.6]  # Dense 우선 (OCR 대응)
         )
         
         retriever_session["retriever"] = ensemble_retriever
@@ -952,7 +1044,7 @@ async def chat(chat_request: ChatRequest):
             # 대용량 챕터 요약
             if query_info["type"] == "chapter_summary":
                 total_content = "".join([doc.page_content for doc in target_docs])
-                if len(total_content) > 28000:  # ~7k tokens
+                if len(total_content) > 28000:
                     print("📚 Large chapter detected, using Map-Reduce")
                     answer = summarize_with_map_reduce(target_docs, llm, chat_request)
                     return ChatResponse(
@@ -963,7 +1055,7 @@ async def chat(chat_request: ChatRequest):
                     )
         
         else:
-            # --- Multi-Stage 검색 파이프라인 ---
+            # --- Multi-Stage 검색 파이프라인 (향상) ---
             ensemble_retriever = retriever_session["retriever"]
             
             target_docs = multi_stage_retrieval(
