@@ -24,7 +24,9 @@ import {
   FormGroup,
   FormControlLabel,
   LinearProgress, // Import LinearProgress
+  IconButton,
 } from '@mui/material';
+import DeleteIcon from '@mui/icons-material/Delete';
 import { useDropzone } from 'react-dropzone';
 import { styled } from '@mui/material/styles';
 import ChatPanel from './components/ChatPanel';
@@ -267,6 +269,27 @@ function App() {
     }
   };
 
+  const handleDeleteDocument = async (docName: string) => {
+    if (window.confirm(`Are you sure you want to delete "${docName}"? This action cannot be undone.`)) {
+      try {
+        showSnackbar(`Deleting ${docName}...`, 'info');
+        const response = await api.deleteDocument(docName);
+        showSnackbar(response.message, 'success');
+        
+        // Refresh document list and update selection
+        fetchDocuments();
+        setSelectedDocuments(prev => {
+          const newSelection = new Set(prev);
+          newSelection.delete(docName);
+          return newSelection;
+        });
+
+      } catch (error: any) {
+        showSnackbar(error.response?.data?.detail || `Failed to delete ${docName}.`, 'error');
+      }
+    }
+  };
+
   const handleSendMessage = async (message: string) => {
     if (!isSessionActive) {
       showSnackbar('Please activate a RAG session by selecting documents first.', 'error'); return;
@@ -377,17 +400,22 @@ function App() {
             ) : (
               <FormGroup sx={{ mb: 2 }}>
                 {allDocuments.map(docName => (
-                  <FormControlLabel
-                    key={docName}
-                    control={
-                      <Checkbox
-                        checked={selectedDocuments.has(docName)}
-                        onChange={(e) => handleDocumentSelection(docName, e.target.checked)}
-                        name={docName}
-                      />
-                    }
-                    label={docName}
-                  />
+                  <Box key={docName} sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <FormControlLabel
+                      control={
+                        <Checkbox
+                          checked={selectedDocuments.has(docName)}
+                          onChange={(e) => handleDocumentSelection(docName, e.target.checked)}
+                          name={docName}
+                        />
+                      }
+                      label={docName}
+                      sx={{ flexGrow: 1 }}
+                    />
+                    <IconButton edge="end" aria-label="delete" onClick={() => handleDeleteDocument(docName)}>
+                      <DeleteIcon />
+                    </IconButton>
+                  </Box>
                 ))}
               </FormGroup>
             )}

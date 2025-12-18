@@ -84,4 +84,11 @@ export const api = {
     const response = await axios.post<ChatResponse>(`${API_BASE_URL}/api/chat`, request);
     return response.data;
   },
+
+  deleteDocument: async (docName: string): Promise<{status: string, message: string}> => {
+    const response = await axios.delete(`${API_BASE_URL}/api/documents`, {
+      data: { doc_name: docName },
+    });
+    return response.data;
+  },
 };

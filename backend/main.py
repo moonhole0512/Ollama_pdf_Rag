@@ -77,6 +77,9 @@ class OllamaModel(BaseModel):
 class OllamaTagsResponse(BaseModel):
     models: List[OllamaModel]
 
+class DeleteRequest(BaseModel):
+    doc_name: str
+
 # --- FastAPI App Initialization ---
 app = FastAPI()
 os.makedirs(DB_PATH, exist_ok=True)
@@ -902,25 +905,45 @@ async def get_documents():
         return []
     return [unquote_plus(d) for d in os.listdir(DB_PATH) if os.path.isdir(os.path.join(DB_PATH, d))]
 
-@app.post("/api/upload")
-async def upload_pdf(
-    provider: str = Form(...),
-    embedding_model: str = Form(...),
-    file: UploadFile = File(...),
-    google_api_key: Optional[str] = Form(None)
+@app.delete("/api/documents")
+async def delete_document(req: DeleteRequest):
+    doc_name = req.doc_name
+    if not doc_name or ".." in doc_name or "/" in doc_name or "\\" in doc_name:
+        raise HTTPException(status_code=400, detail="Invalid document name.")
+
+    try:
+        encoded_doc_name = quote_plus(doc_name)
+        doc_dir = os.path.join(DB_PATH, encoded_doc_name)
+        
+        # Security check: ensure the path is within our DB_PATH
+        if not os.path.abspath(doc_dir).startswith(os.path.abspath(DB_PATH)):
+            raise HTTPException(status_code=400, detail="Invalid document path.")
+
+        if os.path.isdir(doc_dir):
+            shutil.rmtree(doc_dir)
+            return {"status": "success", "message": f"Document '{doc_name}' deleted successfully."}
+        else:
+            raise HTTPException(status_code=404, detail=f"Document '{doc_name}' not found.")
+    except Exception as e:
+        print(f"--- ERROR DELETING DOCUMENT '{doc_name}' ---\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status, BackgroundTasks
+
+# ... (imports and other code) ...
+
+def process_pdf_background(
+    tmp_file_path: str, 
+    filename: str, 
+    provider: str, 
+    embedding_model: str, 
+    google_api_key: Optional[str]
 ):
+    """PDF 처리 로직을 담은 백그라운드 작업 함수"""
     global progress_data
-    progress_data = {"current": 0, "total": 0, "status": "starting", "message": "Upload started..."}
-
-    encoded_filename = quote_plus(file.filename)
+    encoded_filename = quote_plus(filename)
     doc_dir = os.path.join(DB_PATH, encoded_filename)
-    
-    if os.path.exists(doc_dir):
-        raise HTTPException(status_code=409, detail=f"Document '{file.filename}' already exists.")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        shutil.copyfileobj(file.file, tmp_file)
-        tmp_file_path = tmp_file.name
 
     try:
         progress_data.update({"status": "loading", "message": "Loading PDF with pdfplumber..."})
@@ -929,7 +952,7 @@ async def upload_pdf(
             raise HTTPException(status_code=400, detail="Could not extract text from the PDF.")
 
         print(f"\n📄 Document Type: {doc_type}")
-        print(f"📚 '{file.filename}' 구조 분석 중...")
+        print(f"📚 '{filename}' 구조 분석 중...")
         doc_structure = analyze_document_structure(docs, doc_type)
 
         progress_data.update({"status": "chunking", "message": "Splitting document..."})
@@ -996,18 +1019,50 @@ async def upload_pdf(
             empty_index = FAISS.from_texts([" "], embeddings)
             empty_index.save_local(os.path.join(doc_dir, "faiss_index"))
 
-        print(f"\n✅ '{file.filename}' 처리 완료")
+        print(f"\n✅ '{filename}' 처리 완료")
         progress_data.update({"status": "completed", "message": "Processing complete."})
-        return {"status": "success", "filename": file.filename}
 
     except Exception as e:
-        print(f"--- ERROR DURING PDF UPLOAD ---\n{traceback.format_exc()}")
+        print(f"--- ERROR DURING PDF BACKGROUND PROCESSING ---\n{traceback.format_exc()}")
         if os.path.exists(doc_dir):
             shutil.rmtree(doc_dir)
         progress_data.update({"status": "error", "message": str(e)})
-        raise HTTPException(status_code=500, detail=f"Failed to process PDF: {e}")
     finally:
         os.unlink(tmp_file_path)
+
+@app.post("/api/upload")
+async def upload_pdf(
+    background_tasks: BackgroundTasks,
+    provider: str = Form(...),
+    embedding_model: str = Form(...),
+    file: UploadFile = File(...),
+    google_api_key: Optional[str] = Form(None)
+):
+    global progress_data
+    progress_data = {"current": 0, "total": 0, "status": "starting", "message": "Initiating upload..."}
+
+    encoded_filename = quote_plus(file.filename)
+    doc_dir = os.path.join(DB_PATH, encoded_filename)
+    
+    if os.path.exists(doc_dir):
+        raise HTTPException(status_code=409, detail=f"Document '{file.filename}' already exists.")
+
+    # 파일을 임시 위치에 저장
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        shutil.copyfileobj(file.file, tmp_file)
+        tmp_file_path = tmp_file.name
+
+    # 백그라운드에서 PDF 처리 시작
+    background_tasks.add_task(
+        process_pdf_background, 
+        tmp_file_path, 
+        file.filename, 
+        provider, 
+        embedding_model, 
+        google_api_key
+    )
+    
+    return {"status": "processing_started", "filename": file.filename}
 
 @app.post("/api/set-active-documents")
 async def set_active_documents(req: SetActiveDocsRequest):
