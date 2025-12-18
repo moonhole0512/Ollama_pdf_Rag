@@ -2,6 +2,9 @@
 
 이 프로젝트는 PDF 문서의 내용을 기반으로 질문하고 답할 수 있는 RAG(검색 증강 생성) 챗봇 애플리케이션입니다. 사용자는 PDF를 업로드하여 임베딩하고, 웹 인터페이스를 통해 자연어 질문을 던져 문서 기반의 답변을 얻을 수 있습니다.
 
+<img width="1000" height="731" alt="image" src="https://github.com/user-attachments/assets/8542ee8e-c181-42d7-95d5-b50811c59360" />
+
+
 ## ✨ 주요 기능
 
 - **📄 PDF 업로드 및 처리**: PDF 문서를 업로드하면 자동으로 텍스트를 추출하고, 의미 단위로 청킹(Chunking)하여 벡터 데이터베이스에 저장합니다.
@@ -30,13 +33,14 @@
 - Python 3.11 이상
 - Node.js 및 npm (또는 yarn)
 - [Ollama](https://ollama.com/) (로컬 모델을 사용하려는 경우)
+- miniconda3 사용시 run.bat실행하면 가상환경을 backend폴더에 생성하고 실행까지해줍니다.
 
 ### 설치
 
 1.  **저장소 복제:**
     ```bash
-    git clone <repository-url>
-    cd <repository-directory>
+    git clone https://github.com/moonhole0512/Ollama_pdf_Rag.git
+    cd Ollama_pdf_Rag
     ```
 
 2.  **백엔드 종속성 설치:**
@@ -54,9 +58,9 @@
 4.  **(선택사항) Ollama 모델 다운로드:**
     최적의 경험을 위해 추천 모델들을 미리 다운로드 받으세요.
     ```bash
-    ollama pull llama3   # 채팅 모델
-    ollama pull phi3     # 라우터 모델
-    ollama pull bge-m3   # 임베딩 모델
+    ollama pull gpt-oss:20b      # 채팅 모델 (실질적으로 답변을 하는 LLM모델)
+    ollama pull exaone3.5:2.4b   # 라우터 모델 (쿼리 가공을 위한 언어모델, 한글용 모델로 선택했습니다)
+    ollama pull bge-m3           # 임베딩 모델 (청크 가공용 모델)
     ```
 
 ### 실행
@@ -67,16 +71,19 @@
     python backend/main.py
     ```
     서버가 시작되면 프론트엔드도 자동으로 함께 제공됩니다.
+    or run.bat 실행. (miniconda3 지원)
 
-2.  **애플리케이션 접속:**
+3.  **애플리케이션 접속:**
     웹 브라우저를 열고 `http://localhost:8000` 로 접속하세요.
 
 ## 📖 간단 사용법
+ollama 미리 실행필수.
 
 1.  **모델 설정**:
     - 좌측 상단에서 `Ollama` 또는 `Google Gemini` 제공자를 선택합니다.
     - (Ollama 선택 시) 채팅 모델, **라우터 모델**, 임베딩 모델을 선택합니다.
     - (Gemini 선택 시) Google API 키를 입력하고 모델을 선택합니다.
+      제가 gemini 구독 안한상태라서 테스트는 못해봤습니다.
 
 2.  **PDF 업로드**:
     - 'PDF Upload' 섹션으로 파일을 드래그하거나 클릭하여 PDF를 선택합니다.
