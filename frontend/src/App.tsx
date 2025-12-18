@@ -28,18 +28,12 @@ import {
 import { useDropzone } from 'react-dropzone';
 import { styled } from '@mui/material/styles';
 import ChatPanel from './components/ChatPanel';
-import { api, type SetActiveDocsRequest, type ProgressData } from './api';
+import { api, type SetActiveDocsRequest, type ProgressData, type OllamaModel } from './api';
 
 // --- Interfaces & Constants ---
 interface DocumentSource {
   page_content: string;
   metadata: { page: number; source: string; };
-}
-
-interface OllamaModel {
-  name: string;
-  modified_at: string;
-  size: number;
 }
 
 interface ChatMessage {
@@ -73,11 +67,12 @@ function App() {
   const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
   const [chatModel, setChatModel] = useState<string>('');
   const [embeddingModel, setEmbeddingModel] = useState<string>('');
+  const [routerModel, setRouterModel] = useState<string>('default');
   
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [processingPdf, setProcessingPdf] = useState<boolean>(false);
   const [progress, setProgress] = useState<ProgressData>({ current: 0, total: 0, status: 'idle', message: '' });
-
+  
   const [allDocuments, setAllDocuments] = useState<string[]>([]);
   const [selectedDocuments, setSelectedDocuments] = useState<Set<string>>(new Set());
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
@@ -107,10 +102,14 @@ function App() {
         const models = await api.getOllamaModels();
         setOllamaModels(models);
         if (models.length > 0) {
-          const qwenModel = models.find((m: any) => m.name.startsWith('qwen2.5:14b'));
-          const bgeModel = models.find((m: any) => m.name.startsWith('bge-m3'));
+          const qwenModel = models.find((m) => m.name.includes('qwen'));
+          const bgeModel = models.find((m) => m.name.includes('bge-m3'));
+          const phi3Model = models.find((m) => m.name.includes('phi3'));
+          
           setChatModel(qwenModel ? qwenModel.name : models[0].name);
           setEmbeddingModel(bgeModel ? bgeModel.name : models[0].name);
+          setRouterModel(phi3Model ? phi3Model.name : 'default');
+
         }
       } catch (error) {
           console.error("Failed to fetch Ollama models:", error);
@@ -283,6 +282,7 @@ function App() {
       const response = await api.chat({
         provider, question: message, chat_history: chatHistoryRef.current,
         chat_model: chatModel, embedding_model: embeddingModel,
+        router_model: routerModel, // Pass the selected router model
         google_api_key: googleApiKey, system_prompt: systemPrompt,
         retrieval_k: retrievalK,
       });
@@ -297,8 +297,8 @@ function App() {
   };
 
   const renderModelSelectors = () => {
-    const models = provider === 'ollama' ? ollamaModels.map((m) => m.name) : GOOGLE_CHAT_MODELS;
-    const embeddingModels = provider === 'ollama' ? ollamaModels.map((m) => m.name) : GOOGLE_EMBEDDING_MODELS;
+    const models = provider === 'ollama' ? ollamaModels.map((m: OllamaModel) => m.name) : GOOGLE_CHAT_MODELS;
+    const embeddingModels = provider === 'ollama' ? ollamaModels.map((m: OllamaModel) => m.name) : GOOGLE_EMBEDDING_MODELS;
 
     return (
       <Box sx={{ my: 2 }}>
@@ -308,6 +308,17 @@ function App() {
             {models.map((name: string) => (<MenuItem key={name} value={name}>{name}</MenuItem>))}
           </Select>
         </FormControl>
+
+        {provider === 'ollama' && (
+          <FormControl fullWidth sx={{ mb: 2 }}>
+            <InputLabel id="router-model-label">Router Model</InputLabel>
+            <Select labelId="router-model-label" value={routerModel} label="Router Model" onChange={(e) => setRouterModel(e.target.value)} disabled={models.length === 0 || processingPdf || isActivatingSession}>
+              <MenuItem key="default" value="default">Default (phi3, llama3)</MenuItem>
+              {models.map((name: string) => (<MenuItem key={name} value={name}>{name}</MenuItem>))}
+            </Select>
+          </FormControl>
+        )}
+        
         <FormControl fullWidth>
           <InputLabel id="embedding-model-label">Embedding Model</InputLabel>
           <Select labelId="embedding-model-label" value={embeddingModel} label="Embedding Model" onChange={(e) => setEmbeddingModel(e.target.value)} disabled={embeddingModels.length === 0 || processingPdf || isActivatingSession}>

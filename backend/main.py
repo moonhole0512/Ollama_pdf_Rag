@@ -49,6 +49,7 @@ class ChatRequest(BaseModel):
     question: str
     chat_model: str
     embedding_model: str
+    router_model: Optional[str] = None
     system_prompt: Optional[str] = None
     google_api_key: Optional[str] = None
     retrieval_k: Optional[int] = 5
@@ -499,7 +500,7 @@ def get_adaptive_k(query_info: Dict[str, Any], query: str) -> Dict[str, int]:
         final_k = 15
     
     # 3. 목차/구조 질문 (타겟팅된 검색)
-    if query_info["type"] == "toc":
+    if query_info["type"] == "table_of_contents_lookup":
         initial_k = 10
         final_k = 10
     
@@ -552,189 +553,275 @@ def get_adaptive_weights(query: str, query_info: Dict[str, Any]) -> Tuple[float,
     # 6. 기본값 (균형)
     return (0.4, 0.6)  # 이전 0.5, 0.5에서 변경
 
-def classify_query_advanced(
+from typing import List, Tuple, Dict, Any, Optional, Literal
+
+# --- LLM-based Query Router ---
+class IntelligentRouterOutput(BaseModel):
+    """LLM이 반환할 라우팅 및 쿼리 재작성 결과 모델"""
+    intent: Literal[
+        "concept_definition", 
+        "table_of_contents_lookup", 
+        "chapter_summary", 
+        "general_information_retrieval"
+    ]
+    rewritten_query: str
+    expanded_queries: List[str]
+    
+    
+LLM_ROUTER_SYSTEM_PROMPT = """You are an expert query analyzer and rewriter for a Retrieval-Augmented Generation (RAG) system.
+Your task is to understand the user's query, classify its intent, and rewrite it for optimal retrieval.
+
+**1. De-contextualize:**
+If the query contains pronouns like 'that', 'this', 'it', '이거', '저거', '그거', use the provided chat history to resolve them and create a self-contained, complete question.
+- Example (History: "What is the 'reciprocity' principle?", User: "Tell me more about it.") -> Rewritten: "Tell me more about the 'reciprocity' principle."
+
+**2. Classify Intent:**
+Categorize the rewritten query into one of the following intents:
+- `concept_definition`: Asks for the definition, explanation, or meaning of a specific term, concept, principle, or strategy. (e.g., "What is cognitive dissonance?", "설득의 6가지 원칙이란?")
+- `table_of_contents_lookup`: Asks for the table of contents, structure, or list of chapters. (e.g., "Show me the table of contents.", "목차 보여줘.")
+- `chapter_summary`: Asks to summarize a specific chapter. (e.g., "Summarize chapter 3.", "3장 요약해줘.")
+- `general_information_retrieval`: All other questions that seek specific information, examples, or general knowledge from the document. This is the default.
+
+**3. Rewrite and Expand:**
+- **`rewritten_query`**: Create a clear, concise, and keyword-rich version of the de-contextualized query. This should be the best possible query for a search engine.
+- **`expanded_queries`**: Generate 3 additional, diverse search queries based on the original question to improve search recall. These should explore different phrasings, synonyms, or related aspects.
+
+**Output Format:**
+You MUST respond with a single, valid JSON object that adheres to the `IntelligentRouterOutput` schema. Do not add any text before or after the JSON.
+Example JSON:
+{{
+  "intent": "concept_definition",
+  "rewritten_query": "Definition and examples of the commitment and consistency principle",
+  "expanded_queries": [
+    "commitment and consistency principle explained",
+    "How does the commitment and consistency rule work?",
+    "사회적 증거의 원칙"
+  ]
+}}
+"""
+
+
+def intelligent_query_router(
+    query: str, 
+    chat_history: List[Tuple[str, str]],
+    llm: BaseChatModel
+) -> Dict[str, Any]:
+    """LLM을 사용한 지능형 쿼리 분류 및 재작성 (수동 JSON 파싱)"""
+    
+    history_str = "\n".join([f"Human: {h}\nAI: {a}" for h, a in chat_history])
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", LLM_ROUTER_SYSTEM_PROMPT),
+        ("human", "Chat History:\n---\n{history}\n---\n\nUser Query: \"{query}\"")
+    ])
+    
+    chain = prompt | llm | StrOutputParser()
+    
+    try:
+        print("🧠 Calling LLM Router...")
+        response_str = chain.invoke({
+            "history": history_str,
+            "query": query
+        })
+        
+        # LLM 응답에서 JSON 부분만 추출
+        match = re.search(r'\{.*\}', response_str, re.DOTALL)
+        if not match:
+            raise ValueError("LLM did not return a valid JSON object.")
+        
+        json_str = match.group(0)
+        
+        # JSON 파싱 및 Pydantic 모델로 검증
+        response_data = json.loads(json_str)
+        response = IntelligentRouterOutput.model_validate(response_data)
+
+        # 결과를 기존 형식에 맞게 변환
+        output = {
+            "type": response.intent,
+            "rewritten_query": response.rewritten_query,
+            "search_queries": [response.rewritten_query] + response.expanded_queries,
+        }
+        
+        # 특수 타입에 필요한 정보 추가
+        if response.intent == "concept_definition":
+            output["concept"] = response.rewritten_query.replace("Definition and examples of the", "").strip()
+        elif response.intent == "chapter_summary":
+            match_num = re.search(r'\d+', response.rewritten_query)
+            if match_num:
+                output["chapter_num"] = match_num.group(0)
+
+        # fallback 함수가 rewritten_query를 반환하지 않으므로 추가
+        if "rewritten_query" not in output:
+            output["rewritten_query"] = query
+
+        return output
+        
+    except Exception as e:
+        print(f"--- LLM ROUTER ERROR ---")
+        print(f"Error: {e}")
+        print("Falling back to legacy rule-based classification.")
+        return classify_query_advanced_fallback(query, chat_history)
+
+
+def classify_query_advanced_fallback(
     query: str, 
     chat_history: List[Tuple[str, str]]
 ) -> Dict[str, Any]:
-    """향상된 쿼리 분류 및 확장"""
+    """Fallback: 향상된 쿼리 분류 및 확장 (기존 로직)"""
     
     # 쿼리 전처리
     query = preprocess_query(query)
+    rewritten_query = query # fallback에서는 재작성 기능 없으므로 그대로 사용
     query_lower = query.lower()
     
-    # 맥락 해결 (대명사 처리)
-    if any(pronoun in query_lower for pronoun in ["it", "that", "those", "they", "이거", "저거", "그거"]):
-        if chat_history:
-            full_context_query = f"Regarding: '{chat_history[-1][0]}' -> '{chat_history[-1][1]}', now consider: {query}"
-        else:
-            full_context_query = query
-    else:
-        full_context_query = query
-    
-    # 1. 개념 정의 질문 감지 (최우선)
+    # 1. 개념 정의 질문 감지
     definition_patterns = [
         r'(.+?)(이란|란|이라는|라는|은 무엇|는 무엇|이 뭐|가 뭐)',
         r'(.+?)(에 대해|에대해).+(설명|말해|알려)',
         r'(전략|원리|법칙|효과|방법|기법).+(뭐|무엇)',
     ]
-    
     for pattern in definition_patterns:
         match = re.search(pattern, query_lower)
         if match:
             concept = match.group(1).strip()
-            
-            # 핵심 키워드 추출 (조사 제거)
             concept_clean = re.sub(r'\s+(에|의|를|을|가|이|은|는)$', '', concept)
-            
             return {
-                "type": "concept_definition",
-                "concept": concept_clean,
-                "search_queries": [
-                    query,  # 원본 쿼리
-                    concept_clean,  # 핵심 키워드만
-                    f'{concept_clean} 전략',  # 변형 1
-                    f'{concept_clean} 방법',  # 변형 2
-                    # 따옴표 제거 (이전에 있던 문제)
-                ]
+                "type": "concept_definition", "concept": concept_clean,
+                "rewritten_query": rewritten_query,
+                "search_queries": [query, concept_clean, f'{concept_clean} 전략', f'{concept_clean} 방법']
             }
     
     # 2. 목차 질문
     toc_patterns = [r'목차', r'차례', r'구성', r'table of contents', r'toc']
     if any(re.search(p, query_lower) for p in toc_patterns):
-        return {"type": "toc", "search_queries": [query]}
+        return {"type": "table_of_contents_lookup", "rewritten_query": rewritten_query, "search_queries": [query]}
     
     # 3. 챕터 요약
-    summary_match = re.search(
-        r'(summarize|요약)\s*(?:chapter|장)?\s*(\d{1,2})', 
-        query_lower
-    )
+    summary_match = re.search(r'(summarize|요약)\s*(?:chapter|장)?\s*(\d{1,2})', query_lower)
     if summary_match:
         return {
-            "type": "chapter_summary",
-            "chapter_num": summary_match.group(2),
-            "search_queries": [query]
+            "type": "chapter_summary", "chapter_num": summary_match.group(2),
+            "rewritten_query": rewritten_query, "search_queries": [query]
         }
     
     # 4. 일반 주제 질문
     return {
-        "type": "specific_topic",
-        "search_queries": [
-            query,
-            f'{query} 설명',
-            f'{query} 예시',
-        ]
+        "type": "general_information_retrieval",
+        "rewritten_query": rewritten_query,
+        "search_queries": [query, f'{query} 설명', f'{query} 예시']
     }
 
+
+HYDE_PROMPT = """You are a helpful assistant. The user will ask a question.
+Your task is to write a short, one-paragraph, hypothetical answer to the question.
+This answer will be used to find similar documents.
+Focus on capturing the key concepts and terminology. Do not say you don't know the answer.
+Be concise and clear.
+
+User question: {question}
+Hypothetical answer:"""
+
+def generate_hypothetical_answer(query: str, llm: BaseChatModel) -> str:
+    """HyDE: LLM을 사용하여 질문에 대한 가상 답변 생성"""
+    prompt = ChatPromptTemplate.from_template(HYDE_PROMPT)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"question": query})
+
+
 def multi_stage_retrieval(
-    query: str,
     query_info: Dict[str, Any],
-    ensemble_retriever: EnsembleRetriever,
+    retrievers: Dict[str, Any],
     all_parent_docs: List[Document],
-    chat_request: ChatRequest
+    chat_request: ChatRequest,
+    llm: BaseChatModel,
+    embeddings: Embeddings
 ) -> List[Document]:
-    """다단계 검색 파이프라인 (향상된 버전)"""
+    """다단계 검색 파이프라인 (HyDE + Reranking)"""
     
-    # Stage 1: 적응형 K값 결정
-    adaptive_k = get_adaptive_k(query_info, query)
+    original_query = chat_request.question
+    rewritten_query = query_info["rewritten_query"]
     
-    # Stage 2: 가중치 조정 (OCR 고려)
-    bm25_weight, dense_weight = get_adaptive_weights(query, query_info)
-    ensemble_retriever.weights = [bm25_weight, dense_weight]
+    # Stage 1: 적응형 K값 및 가중치 결정
+    adaptive_k = get_adaptive_k(query_info, rewritten_query)
+    bm25_weight, dense_weight = get_adaptive_weights(rewritten_query, query_info)
     
     print(f"\n🔍 Adaptive Search Config:")
     print(f"   Query Type: {query_info['type']}")
-    print(f"   Initial K: {adaptive_k['initial_k']}")
-    print(f"   Final K: {adaptive_k['final_k']}")
-    print(f"   Weights: BM25={bm25_weight:.1f}, Dense={dense_weight:.1f}")
+    print(f"   Rewritten Query: {rewritten_query}")
+    print(f"   K: {adaptive_k['final_k']} (Initial: {adaptive_k['initial_k']})")
+    print(f"   Weights: BM25={bm25_weight:.2f}, Dense={dense_weight:.2f}")
+
+    # Stage 2: HyDE (Hypothetical Document Embeddings)
+    hypothetical_answer = generate_hypothetical_answer(rewritten_query, llm)
+    print(f"   🧠 HyDE Answer: {hypothetical_answer[:100]}...")
+    hyde_embedding = embeddings.embed_query(hypothetical_answer)
+
+    # Stage 3: 하이브리드 검색 (BM25 + HyDE-based Dense)
+    # BM25 검색
+    bm25_retriever = retrievers['bm25']
+    bm25_docs = bm25_retriever.get_relevant_documents(rewritten_query)
     
-    # Stage 3: Query Expansion (개선)
-    expanded_queries = query_info["search_queries"]
+    # Dense 검색 (ParentDocumentRetriever의 vectorstore 직접 사용)
+    parent_retriever = retrievers['parent']
+    dense_docs_with_scores = parent_retriever.vectorstore.similarity_search_with_score_by_vector(
+        hyde_embedding, k=adaptive_k['initial_k']
+    )
     
-    # Stage 4: 초기 검색 (넓게)
-    all_retrieved = []
-    seen_contents = set()
+    # ParentDocumentRetriever를 통해 부모 문서 가져오기
+    dense_parent_doc_ids = [doc.metadata['parent_id'] for doc, score in dense_docs_with_scores]
+    dense_parent_docs = parent_retriever.docstore.mget(dense_parent_doc_ids)
+
+    # Stage 4: 결과 병합 및 가중치 적용
+    combined_results = {}
+    for i, doc in enumerate(bm25_docs):
+        combined_results[doc.page_content] = combined_results.get(doc.page_content, 0) + bm25_weight * (1 / (i + 1))
+        
+    for i, doc in enumerate(dense_parent_docs):
+        if doc: # docstore.mget은 None을 반환할 수 있음
+             combined_results[doc.page_content] = combined_results.get(doc.page_content, 0) + dense_weight * (1 / (i + 1))
+
+    # 점수 기준으로 정렬
+    sorted_docs_content = sorted(combined_results.keys(), key=lambda k: combined_results[k], reverse=True)
     
-    for q in expanded_queries[:5]:
-        try:
-            docs = ensemble_retriever.get_relevant_documents(q)
-            for doc in docs[:adaptive_k['initial_k']]:
-                content_key = doc.page_content[:100]
-                if content_key not in seen_contents:
-                    all_retrieved.append(doc)
-                    seen_contents.add(content_key)
-        except Exception as e:
-            print(f"   Warning: Query '{q}' failed: {e}")
-            continue
-    
-    if not all_retrieved:
-        print("   ⚠️ No documents retrieved, using fallback")
-        return all_parent_docs[:adaptive_k['final_k']]
-    
-    print(f"   📚 Total retrieved (before dedup): {len(all_retrieved)}")
-    
-    # Stage 5: 중요도 점수 추가 (향상)
-    docs_with_importance = []
-    for doc in all_retrieved:
-        importance = calculate_chunk_importance(doc, query)
-        docs_with_importance.append((doc, importance))
-    
-    # Stage 6: Cross-Encoder Reranking
+    # 원본 Document 객체 찾기
+    doc_map = {doc.page_content: doc for doc in all_parent_docs}
+    initial_retrieved_docs = [doc_map[content] for content in sorted_docs_content if content in doc_map]
+
+    if not initial_retrieved_docs:
+        print("   ⚠️ No documents retrieved from hybrid search.")
+        return []
+
+    print(f"   📚 Hybrid retrieved (before rerank): {len(initial_retrieved_docs)}")
+
+    # Stage 5: Cross-Encoder Reranking
     cross_encoder = get_cross_encoder_model()
+    rerank_pairs = [[rewritten_query, doc.page_content] for doc in initial_retrieved_docs[:50]] # Rerank 상위 50개만
+    
+    if rerank_pairs:
+        ce_scores = cross_encoder.predict(rerank_pairs)
+    else:
+        ce_scores = []
+        
     docs_with_scores = []
-    
-    for doc, importance in docs_with_importance:
-        try:
-            # Cross-encoder 점수
-            ce_score = cross_encoder.predict([[query, doc.page_content]])[0]
-            
-            # 중요도와 결합 (중요도 비중 증가)
-            combined_score = 0.5 * float(ce_score) + 0.5 * min(importance / 10.0, 1.0)
-            
-            docs_with_scores.append((doc, combined_score, importance))
-        except Exception as e:
-            # Cross-encoder 실패 시 중요도만 사용
-            docs_with_scores.append((doc, importance * 0.01, importance))
-    
-    # Stage 7: 최종 정렬 및 선택
+    for doc, ce_score in zip(rerank_pairs, ce_scores):
+        # 구조적 중요도 점수 반영
+        importance = calculate_chunk_importance(initial_retrieved_docs[len(docs_with_scores)], rewritten_query)
+        # 최종 점수 = Cross-Encoder 점수 + 구조적 중요도
+        final_score = float(ce_score) + (importance / 100.0)
+        docs_with_scores.append((initial_retrieved_docs[len(docs_with_scores)], final_score, importance, ce_score))
+
     docs_with_scores.sort(key=lambda x: x[1], reverse=True)
     
-    # Stage 8: Multi-hop 검색 (초기 검색 실패 시)
-    top_score = docs_with_scores[0][1] if docs_with_scores else 0
-    
-    if top_score < 0.3:  # 신뢰도가 낮으면
-        print("   🔄 Low confidence, attempting multi-hop retrieval...")
-        
-        # 인접 페이지 검색
-        top_pages = [doc.metadata.get('page', 0) for doc, _, _ in docs_with_scores[:5]]
-        expanded_pages = set()
-        
-        for page in top_pages:
-            expanded_pages.update(range(page - 2, page + 3))  # 앞뒤 2페이지
-        
-        additional_docs = [
-            doc for doc in all_parent_docs
-            if doc.metadata.get('page', 0) in expanded_pages
-        ]
-        
-        # 추가 문서 점수 계산
-        for doc in additional_docs:
-            if doc not in [d for d, _, _ in docs_with_scores]:
-                importance = calculate_chunk_importance(doc, query)
-                docs_with_scores.append((doc, importance * 0.005, importance))
-        
-        docs_with_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    final_docs = [doc for doc, _, _ in docs_with_scores[:adaptive_k['final_k']]]
-    
-    # Stage 9: 디버깅 정보 출력 (향상)
-    print(f"\n📊 Top Retrieval Results:")
-    for i, (doc, score, importance) in enumerate(docs_with_scores[:15], 1):
+    final_docs = [doc for doc, _, _, _ in docs_with_scores[:adaptive_k['final_k']]]
+
+    # Stage 6: 디버깅 정보 출력
+    print(f"\n📊 Top Reranked Results:")
+    for i, (doc, score, imp, ce) in enumerate(docs_with_scores[:10], 1):
         page = doc.metadata.get('page', '?')
-        concept = doc.metadata.get('concept_title', 'N/A')[:40]
-        content_preview = doc.page_content[:60].replace('\n', ' ')
-        print(f"   {i:2}. Page {page:3} | Score: {score:.3f} | Imp: {importance:6.1f} | {concept}")
-        print(f"       Preview: {content_preview}...")
-    
+        sec_hier = doc.metadata.get('section_hierarchy', 'N/A')
+        preview = doc.page_content[:60].replace('\n', ' ')
+        print(f"   {i:2}. P{page:3} | Score: {score:.3f} (CE: {ce:.3f}, Imp: {imp:.1f}) | Sec: {sec_hier} | {preview}...")
+
     return final_docs
 
 def get_targeted_documents(
@@ -926,7 +1013,7 @@ async def upload_pdf(
 async def set_active_documents(req: SetActiveDocsRequest):
     global retriever_session
     if not req.document_names:
-        retriever_session = {"retriever": None, "all_parent_docs": [], "document_structure": {}}
+        retriever_session = {"retrievers": None, "all_parent_docs": [], "document_structure": {}}
         return {"message": "No documents selected."}
 
     try:
@@ -986,14 +1073,14 @@ async def set_active_documents(req: SetActiveDocsRequest):
             parent_id_field="parent_id"
         )
         bm25_retriever = BM25Retriever.from_documents(all_parent_docs)
-        ensemble_retriever = EnsembleRetriever(
-            retrievers=[bm25_retriever, parent_retriever],
-            weights=[0.4, 0.6]  # Dense 우선 (OCR 대응)
-        )
         
-        retriever_session["retriever"] = ensemble_retriever
+        retriever_session["retrievers"] = {
+            "bm25": bm25_retriever,
+            "parent": parent_retriever
+        }
         retriever_session["all_parent_docs"] = all_parent_docs
         retriever_session["document_structure"] = combined_structure
+        retriever_session["embeddings"] = embeddings # 임베딩 모델 저장
         
         print(f"✅ RAG 세션 활성화 완료")
         print(f"   Total parent docs: {len(all_parent_docs)}")
@@ -1003,46 +1090,71 @@ async def set_active_documents(req: SetActiveDocsRequest):
 
     except Exception as e:
         print(f"--- ERROR ---\n{traceback.format_exc()}")
-        retriever_session = {"retriever": None, "all_parent_docs": [], "document_structure": {}}
+        retriever_session = {"retrievers": None, "all_parent_docs": [], "document_structure": {}}
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(chat_request: ChatRequest):
     global retriever_session
-    if not retriever_session.get("retriever"):
+    if not retriever_session.get("retrievers"):
         raise HTTPException(status_code=400, detail="No active RAG session.")
 
     try:
+        # 1. 기본 LLM 및 임베딩 모델 로드
         llm = get_chat_model(
             chat_request.provider, 
             chat_request.chat_model, 
             chat_request.google_api_key
         )
+        embeddings = retriever_session["embeddings"]
         
-        # 향상된 쿼리 분류
-        query_info = classify_query_advanced(
+        # 2. 라우팅을 위한 경량 LLM 로드 (Ollama 사용)
+        router_llm = None
+        if chat_request.router_model and chat_request.router_model != "default":
+            try:
+                router_llm = get_chat_model("ollama", chat_request.router_model)
+                print(f"🧠 Using selected router model: {chat_request.router_model}")
+            except Exception as e:
+                print(f"⚠️ Failed to load selected router model '{chat_request.router_model}'. Error: {e}")
+        
+        if not router_llm:
+            try:
+                router_llm = get_chat_model("ollama", "phi3") 
+            except Exception:
+                try:
+                    router_llm = get_chat_model("ollama", "llama3")
+                except Exception:
+                    print("⚠️ Default router LLM (phi3, llama3) not found. Using main chat model for routing.")
+                    router_llm = llm
+
+        # 3. LLM 기반 지능형 쿼리 라우터 호출
+        query_info = intelligent_query_router(
             chat_request.question, 
-            chat_request.chat_history
+            chat_request.chat_history,
+            router_llm
         )
-        print(f"\n🔍 Query Classification:")
-        print(f"   Type: {query_info['type']}")
+        print(f"\n🧠 LLM Router Output:")
+        print(f"   Intent: {query_info['type']}")
         if 'concept' in query_info:
-            print(f"   Concept: {query_info['concept']}")
+            print(f"   Concept: {query_info.get('concept', 'N/A')}")
         print(f"   Search Queries: {query_info['search_queries']}")
         
         all_parent_docs = retriever_session["all_parent_docs"]
         doc_structure = retriever_session["document_structure"]
         
-        # --- 특수 케이스 처리: TOC & Chapter Summary ---
-        if query_info["type"] in ["chapter_summary", "toc"]:
+        # --- 특수 케이스 처리: 목차 조회 및 챕터 요약 ---
+        if query_info["type"] in ["chapter_summary", "table_of_contents_lookup"]:
+            temp_query_info = query_info.copy()
+            if temp_query_info["type"] == "table_of_contents_lookup":
+                temp_query_info["type"] = "toc"
+
             target_docs = get_targeted_documents(
-                query_info, 
+                temp_query_info, 
                 all_parent_docs, 
                 doc_structure
             )
             
-            # 대용량 챕터 요약
-            if query_info["type"] == "chapter_summary":
+            if query_info.get("type") == "chapter_summary":
                 total_content = "".join([doc.page_content for doc in target_docs])
                 if len(total_content) > 28000:
                     print("📚 Large chapter detected, using Map-Reduce")
@@ -1055,49 +1167,52 @@ async def chat(chat_request: ChatRequest):
                     )
         
         else:
-            # --- Multi-Stage 검색 파이프라인 (향상) ---
-            ensemble_retriever = retriever_session["retriever"]
+            # --- HyDE 기반 다단계 검색 파이프라인 ---
+            retrievers = retriever_session["retrievers"]
             
             target_docs = multi_stage_retrieval(
-                query=chat_request.question,
                 query_info=query_info,
-                ensemble_retriever=ensemble_retriever,
+                retrievers=retrievers,
                 all_parent_docs=all_parent_docs,
-                chat_request=chat_request
+                chat_request=chat_request,
+                llm=llm,
+                embeddings=embeddings
             )
         
         # --- 답변 생성 ---
-        context_string = "\n\n".join([
-            f"[Page {doc.metadata.get('page', '?')}, "
-            f"Section {doc.metadata.get('section_hierarchy', 'N/A')}]\n"
-            f"{doc.page_content}" 
-            for doc in target_docs
-        ])
-        
-        system_instruction = (
-            "You are a technical expert assistant. Analyze the provided context carefully and answer the question.\n\n"
-            "Instructions:\n"
-            "- For concept definitions, provide a clear and precise explanation\n"
-            "- Use examples from the context when available\n"
-            "- Cite your sources using the format [Page X, Section Y]\n"
-            "- If the exact answer is not in the context, state this clearly\n"
-            "- For Korean queries, respond in Korean\n"
-            "- Be concise but thorough\n"
-        )
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_instruction),
-            ("human", "Context:\n{context}\n\nQuestion: {question}\n\nProvide a detailed answer with citations.")
-        ])
-        
-        chain = prompt | llm | StrOutputParser()
-        answer = chain.invoke({
-            "context": context_string,
-            "question": chat_request.question
-        })
-        
-        # 인용 추출
-        citations = re.findall(r'\[Page \d+[^\]]*\]', answer)
+        if not target_docs:
+             answer = "죄송합니다, 관련 정보를 문서에서 찾을 수 없습니다."
+             citations = []
+        else:
+            context_string = "\n\n".join([
+                f"[Page {doc.metadata.get('page', '?')}, "
+                f"Section {doc.metadata.get('section_hierarchy', 'N/A')}]\n"
+                f"{doc.page_content}" 
+                for doc in target_docs
+            ])
+            
+            system_instruction = (
+                "You are a technical expert assistant. Analyze the provided context carefully and answer the question.\n\n"
+                "Instructions:\n"
+                "- For concept definitions, provide a clear and precise explanation\n"
+                "- Use examples from the context when available\n"
+                "- Cite your sources using the format [Page X, Section Y]\n"
+                "- If the exact answer is not in the context, state this clearly\n"
+                "- For Korean queries, respond in Korean\n"
+                "- Be concise but thorough\n"
+            )
+            
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_instruction),
+                ("human", "Context:\n{context}\n\nQuestion: {question}\n\nProvide a detailed answer with citations.")
+            ])
+            
+            chain = prompt | llm | StrOutputParser()
+            answer = chain.invoke({
+                "context": context_string,
+                "question": chat_request.question
+            })
+            citations = re.findall(r'\[Page \d+[^\]]*\]', answer)
 
         print(f"\n✅ Answer generated successfully")
         print(f"   Citations found: {len(citations)}")

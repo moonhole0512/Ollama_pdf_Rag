@@ -8,6 +8,7 @@ export interface ChatRequest {
   question: string;
   chat_model: string;
   embedding_model: string;
+  router_model?: string;
   google_api_key?: string;
   system_prompt?: string;
   retrieval_k?: number;
