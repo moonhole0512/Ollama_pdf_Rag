@@ -70,7 +70,7 @@ REM --- Start Server ---
 echo Starting FastAPI server...
 echo Visit http://localhost:%APP_PORT% in your browser.
 set "PYTHONPATH=%~dp0"
-uvicorn backend.main:app --host 0.0.0.0 --port %APP_PORT%
+uvicorn backend.api.main:app --host 0.0.0.0 --port %APP_PORT%
 
 endlocal
 pause

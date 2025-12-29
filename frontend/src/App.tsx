@@ -64,12 +64,11 @@ function App() {
   const [provider, setProvider] = useState<ModelProvider>('ollama');
   const [googleApiKey, setGoogleApiKey] = useState<string>('');
   const [systemPrompt, setSystemPrompt] = useState<string>(() => localStorage.getItem('systemPrompt') || DEFAULT_SYSTEM_PROMPT);
-  const [retrievalK, setRetrievalK] = useState<number>(5);
 
   const [ollamaModels, setOllamaModels] = useState<OllamaModel[]>([]);
-  const [chatModel, setChatModel] = useState<string>('');
+  const [chatModel, setChatModel] = useState<string>(() => localStorage.getItem('lastChatModel') || '');
   const [embeddingModel, setEmbeddingModel] = useState<string>('');
-  const [routerModel, setRouterModel] = useState<string>('default');
+  const [routerModel, setRouterModel] = useState<string>(() => localStorage.getItem('lastRouterModel') || 'default');
   
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [processingPdf, setProcessingPdf] = useState<boolean>(false);
@@ -108,18 +107,27 @@ function App() {
           const bgeModel = models.find((m) => m.name.includes('bge-m3'));
           const phi3Model = models.find((m) => m.name.includes('phi3'));
           
-          setChatModel(qwenModel ? qwenModel.name : models[0].name);
-          setEmbeddingModel(bgeModel ? bgeModel.name : models[0].name);
-          setRouterModel(phi3Model ? phi3Model.name : 'default');
-
+          if (!chatModel) { // Only set if not already loaded from localStorage
+            setChatModel(qwenModel ? qwenModel.name : models[0].name);
+          }
+          if (!embeddingModel) { // Always set embedding model if not set
+            setEmbeddingModel(bgeModel ? bgeModel.name : models[0].name);
+          }
+          if (routerModel === 'default') { // Only set if not already loaded from localStorage
+            setRouterModel(phi3Model ? phi3Model.name : 'default');
+          }
         }
       } catch (error) {
           console.error("Failed to fetch Ollama models:", error);
           showSnackbar('Failed to fetch Ollama models. Is Ollama running?', 'error');
       }
     } else {
-      setChatModel(GOOGLE_CHAT_MODELS[0]);
-      setEmbeddingModel(GOOGLE_EMBEDDING_MODELS[0]);
+      if (!chatModel) {
+        setChatModel(GOOGLE_CHAT_MODELS[0]);
+      }
+      if (!embeddingModel) {
+        setEmbeddingModel(GOOGLE_EMBEDDING_MODELS[0]);
+      }
     }
   }, [provider]);
 
@@ -145,6 +153,15 @@ function App() {
   useEffect(() => {
     localStorage.setItem('systemPrompt', systemPrompt);
   }, [systemPrompt]);
+
+  useEffect(() => {
+    localStorage.setItem('lastChatModel', chatModel);
+  }, [chatModel]);
+
+  useEffect(() => {
+    localStorage.setItem('lastRouterModel', routerModel);
+  }, [routerModel]);
+
 
   // Effect for polling PDF processing progress
   useEffect(() => {
@@ -307,7 +324,6 @@ function App() {
         chat_model: chatModel, embedding_model: embeddingModel,
         router_model: routerModel, // Pass the selected router model
         google_api_key: googleApiKey, system_prompt: systemPrompt,
-        retrieval_k: retrievalK,
       });
       const { answer, source_documents } = response;
       setChatMessages(prev => [...prev, { type: 'ai', text: answer, sources: source_documents }]);
@@ -368,8 +384,6 @@ function App() {
             {provider === 'google' && <TextField label="Google API Key" type="password" value={googleApiKey} onChange={(e) => setGoogleApiKey(e.target.value)} fullWidth sx={{ mb: 2 }}/>}
             <Divider sx={{ my: 1 }}><Typography variant="overline">Model Selection</Typography></Divider>
             {renderModelSelectors()}
-            <Divider sx={{ my: 1 }}><Typography variant="overline">Retrieval</Typography></Divider>
-            <TextField label="Chunks to Retrieve (k)" type="number" value={retrievalK} onChange={(e) => setRetrievalK(Number(e.target.value))} fullWidth sx={{ mb: 2 }}/>
             
             <Divider sx={{ my: 1 }}><Typography variant="overline">PDF Upload</Typography></Divider>
             <DropzoneContainer {...getRootProps()}>
